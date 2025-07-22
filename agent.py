@@ -1,8 +1,7 @@
 import os
 from typing import Annotated, Dict, List, Optional
-from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_experimental.tools import PythonREPLTool
-from langchain_core.prompts import ChatPromptTemplate, MessagePlaceholder
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_groq import ChatGroq
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -16,11 +15,19 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph import END, StateGraph, START
 from langgraph.prebuilt import create_react_agent
 
+# Use the newer tavily package to avoid deprecation warning
+try:
+    from langchain_tavily import TavilySearchResults
+except ImportError:
+    # Fallback to the older import if new package not available
+    from langchain_community.tools.tavily_search import TavilySearchResults
+
 
 load_dotenv()
-api_key = os.getenv("GROQ_API_KEY")
+groq_api_key = os.getenv("GROQ_API_KEY")
+tavily_api_key = os.getenv("TAVILY_API_KEY")
 
-tavily_tool = TavilySearchResults(max_results=5)
+tavily_tool = TavilySearchResults(max_results=5, api_key=tavily_api_key)
 
 #This executes code locally, which can be unsafe
 python_repl_tool = PythonREPLTool()
@@ -33,11 +40,13 @@ def agent_node(state, agent, name):
 
 members = ["Researcher", "Coder"]
 system_prompt = (
-    "You are a supervisor tasked with managing a conversation between the"
-    "following workers: {members}. Given the following user request,"
-    "respond with the worker to act next. Each worker will perform a"
-    "task and respond with their results and status. When finished,"
-    "respond with FINISH."
+    "You are a supervisor tasked with managing a conversation between the "
+    "following workers: {members}. Given the following user request, "
+    "respond with the worker to act next. Each worker will perform a "
+    "task and respond with their results and status. "
+    "For tasks requiring both research and coding (like creating reports), "
+    "first send to Researcher to gather information, then to Coder to "
+    "create the final output. When finished, respond with FINISHED."
 )
 
 #Our team supervisor is an LLM node. It just picks the next agent to process
@@ -45,12 +54,12 @@ system_prompt = (
 options = ["FINISHED"] + members
 
 class routeResponse(BaseModel):
-    next:Literal[*options]
+    next: Literal["FINISHED", "Researcher", "Coder"]
 
 prompt = ChatPromptTemplate.from_messages(
     [
         ("system", system_prompt),
-        MessagePlaceholder(variable_name="messages"),
+        MessagesPlaceholder(variable_name="messages"),
         (
             "system",
             "Given the conversation above, who should act next?"
@@ -59,10 +68,11 @@ prompt = ChatPromptTemplate.from_messages(
     ]
 ).partial(options=str(options), members=", ".join(members))
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=api_key)
+llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=groq_api_key)
 def supervisor_agent(state):
     supervisor_chain = prompt | llm.with_structured_output(routeResponse)
-    return supervisor_chain.invoke(state)
+    response = supervisor_chain.invoke(state)
+    return {"next": response.next}
 
 #The agent state is the input to each node in the graph.
 class AgentState(TypedDict):
@@ -86,13 +96,13 @@ workflow.add_node("Supervisor", supervisor_agent)
 
 for member in members:
     #We want our workers to ALWAYS "report back" to the supervisor when done 
-    workflow.add_edge(member, "supervisor")
+    workflow.add_edge(member, "Supervisor")
 
 #The supervisor populates the "next" field in the graph state
 #which routes to a node or finishes
 conditional_map = {k: k for k in members}
-conditional_map["FINISH"] = END
-workflow.add_conditional_edges("supervisor", lambda x: x["next"], conditional_map)
+conditional_map["FINISHED"] = END
+workflow.add_conditional_edges("Supervisor", lambda x: x["next"], conditional_map)
 #finally add entrypoint
 workflow.add_edge(START, "Supervisor")
 
@@ -102,11 +112,29 @@ while True:
     user_input = input("User: ")
     if user_input.lower() == "exit":
         break
+    
+    print("🤖 Multi-Agent System Processing...")
     #Initialize the graph state with the user input
     state = {"messages": [HumanMessage(content=user_input)]}
-    #Run the graph
-    result = graph.run(state)
-    #Print the final result
-    print("Supervisor:", result["messages"][-1].content)
-
     
+    #Run the graph and show progress
+    try:
+        result = graph.invoke(state)
+        #Print the final result
+        print("\n" + "="*50)
+        print("📋 FINAL RESULT:")
+        print("="*50)
+        
+        # Show all agent responses
+        for i, message in enumerate(result["messages"]):
+            if hasattr(message, 'name') and message.name:
+                print(f"\n🎯 {message.name}:")
+                print(f"{message.content}")
+            elif i == 0:  # First message is user input
+                print(f"\n👤 User: {message.content}")
+        
+        print("\n" + "="*50)
+        
+    except Exception as e:
+        print(f"❌ Error occurred: {str(e)}")
+        print("Please try again or type 'exit' to quit.")
